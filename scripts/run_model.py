@@ -74,28 +74,34 @@ class VisionAugmentedLLM(nn.Module):
 
 
 # --- ADJUSTED Generation function for inference ---
-@torch.no_grad() # Ensure no gradients are calculated during inference
+@torch.no_grad()
 def generate_shader_from_image(model, image_path, instruction="Generate an HLSL shader that reproduces this image", max_new_tokens=1024, device="cpu"):
     model.eval() # Set model to evaluation mode
-    model.to(device)
+    # Move model to device AND set dtype
+    model.to(device, dtype=torch.float32) # Force float32
 
-    # --- 1. Process Image ---
-    image = Image.open(image_path).convert("RGB")
-    image = image.resize(IMAGE_SIZE)
+    # --- Access components (they are now on device and float32) ---
     image_processor = model.get_image_processor()
-    vision_model = model.get_vision_model().to(device)
-    vision_projection = model.get_vision_projection().to(device)
-    llm = model.get_llm().to(device)
+    vision_model = model.get_vision_model() # Already moved by model.to()
+    vision_projection = model.get_vision_projection() # Already moved
+    llm = model.get_llm() # Already moved
     tokenizer = model.get_tokenizer()
 
-    # Process image and move to device
+    # --- 1. Process Image ---
+    # ---> ADDED BACK THE MISSING IMAGE LOADING <---
+    print(f"Loading image from: {image_path}")
+    image = Image.open(image_path).convert("RGB")
+    image = image.resize(IMAGE_SIZE)
+    # ---> END ADDED BACK <---
+
+    # Process image - ensure inputs match the model dtype
     image_inputs = image_processor(images=image, return_tensors="pt").to(device)
-    pixel_values = image_inputs['pixel_values']
+    pixel_values = image_inputs['pixel_values'].to(dtype=torch.float32) # Match dtype
 
     # Get image features and project them
-    image_features = vision_model.get_image_features(pixel_values=pixel_values) # [1, vision_dim]
-    projected_features = vision_projection(image_features) # [1, llm_dim]
-    projected_features = projected_features.unsqueeze(1) # [1, 1, llm_dim] - Add sequence dimension
+    image_features = vision_model.get_image_features(pixel_values=pixel_values)
+    projected_features = vision_projection(image_features)
+    projected_features = projected_features.unsqueeze(1) # [1, 1, llm_dim]
 
     # --- 2. Process Text Prompt ---
     prompt = f"""### Instruction:
@@ -106,26 +112,22 @@ Reference image provided
 
 ### Response:
 """
-    # Tokenize prompt but DON'T get input_ids yet, we need embeddings
-    # We need the embeddings directly to combine with the image embedding
     prompt_inputs = tokenizer(prompt, return_tensors="pt").to(device)
     prompt_input_ids = prompt_inputs["input_ids"]
     prompt_attention_mask = prompt_inputs["attention_mask"]
 
-    # Get text embeddings
     embed_layer = llm.get_input_embeddings()
-    prompt_embeds = embed_layer(prompt_input_ids) # [1, prompt_seq_len, llm_dim]
+    prompt_embeds = embed_layer(prompt_input_ids) # Embeddings will be float32
 
     # --- 3. Combine Embeddings ---
-    # Prepend the visual embedding to the text prompt embedding
-    combined_embeds = torch.cat([projected_features, prompt_embeds], dim=1) # [1, 1 + prompt_seq_len, llm_dim]
+    combined_embeds = torch.cat([projected_features, prompt_embeds], dim=1)
 
     # --- 4. Create Combined Attention Mask ---
-    visual_attention = torch.ones(projected_features.shape[:2], device=device) # [1, 1]
-    combined_attention_mask = torch.cat([visual_attention, prompt_attention_mask], dim=1) # [1, 1 + prompt_seq_len]
+    visual_attention = torch.ones(projected_features.shape[:2], device=device)
+    combined_attention_mask = torch.cat([visual_attention, prompt_attention_mask], dim=1)
 
     # --- 5. Generate ---
-    # Use inputs_embeds and attention_mask with generate
+    print("Generating text...")
     output_ids = llm.generate(
         inputs_embeds=combined_embeds,
         attention_mask=combined_attention_mask,
@@ -133,66 +135,55 @@ Reference image provided
         do_sample=True,
         temperature=0.7,
         top_p=0.9,
-        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id # Important for generation
+        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     )
+    print("Generation complete.")
 
     # --- 6. Decode ---
-    # Decode only the generated part (after the combined input length)
-    # input_length = combined_embeds.shape[1] # Length of prompt + visual token
-    # generated_ids = output_ids[0, input_length:]
-    # Use skip_special_tokens=True to remove padding/eos tokens from output string
-    # Decode the whole sequence and slice later might be safer depending on model generation behavior
+    print("Decoding output...")
     full_output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-    # Find the start of the response in the decoded text
-    # The prompt structure helps here
     response_marker = "### Response:\n"
     response_start_index = full_output_text.find(response_marker)
     if response_start_index != -1:
         shader_code = full_output_text[response_start_index + len(response_marker):].strip()
     else:
-        # Fallback: try to remove the original prompt (might be less reliable if generation modifies it)
+        # Fallback if marker not found
         prompt_only_decoded = tokenizer.decode(prompt_input_ids[0], skip_special_tokens=True)
-        # Find where the prompt ends (roughly)
-        prompt_end_index = full_output_text.find(prompt_only_decoded) + len(prompt_only_decoded)
-        shader_code = full_output_text[prompt_end_index:].strip() # Less precise removal
+        # This fallback is approximate
+        prompt_end_index = len(prompt_only_decoded)
+        shader_code = full_output_text[prompt_end_index:].strip() # May include part of the prompt if generation repeated it
 
+    print("Decoding complete.")
     return shader_code
 
-# Example usage
+# Make sure the rest of your run_model.py script uses this corrected function.
+# The main loading part should look like this:
+
 if __name__ == "__main__":
     # --- Manual Loading ---
     print(f"Loading model components for inference...")
-    # 1. Instantiate the custom model architecture
-    # Ensure LLM_MODEL_NAME and VISION_MODEL_NAME match training
     model = VisionAugmentedLLM(LLM_MODEL_NAME, VISION_MODEL_NAME)
-
-    # 2. Construct path to the saved weights
     weights_path = os.path.join(OUTPUT_DIR, "pytorch_model.bin")
     if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Model weights not found at {weights_path}. Make sure training saved the model correctly.")
-
-    # 3. Load the state dictionary
+        raise FileNotFoundError(f"Model weights not found at {weights_path}.")
     print(f"Loading state dict from {weights_path}...")
-    # Load onto CPU first to avoid potential GPU memory issues during loading
     state_dict = torch.load(weights_path, map_location="cpu")
-
-    # 4. Apply the state dictionary to the model
     model.load_state_dict(state_dict)
     print("Model weights loaded successfully.")
 
     # --- Set device for inference ---
-    # device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu") # Force CPU
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu") # Uncomment to force CPU for testing
     print(f"Using device: {device}")
-    # Note: Components within the model will be moved to the device inside generate_shader_from_image
 
     # --- Run Inference ---
-    image_file = "data/val/080.png" # Make sure this path is correct
+    image_file = "data/val/080.png" # Adjust path as needed
     if not os.path.exists(image_file):
          print(f"Warning: Test image {image_file} not found. Skipping generation.")
     else:
         print(f"Generating shader for image: {image_file}...")
+        # Use the corrected generate_shader_from_image function
         shader_code = generate_shader_from_image(model, image_file, device=device)
         print("\n--- Generated Shader Code ---")
         print(shader_code)
