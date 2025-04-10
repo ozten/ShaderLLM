@@ -17,6 +17,10 @@ from transformers import (
 from torch import nn
 import logging # Added for better logging
 
+import evaluate # <-- Import evaluate
+import numpy as np
+import nltk # <-- Often needed for rouge/bleu tokenization
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,6 +34,32 @@ TRAIN_DATA_DIR = "./data/train"
 VAL_DATA_DIR = "./data/val"
 MAX_LENGTH = 2048
 # IMAGE_SIZE = (224, 224) # No longer needed for training
+
+
+# --- Define Compute Metrics ---
+# Ensure nltk punkt tokenizer is downloaded (needed for ROUGE)
+try:
+    # Check if 'punkt' is already available
+    nltk.data.find('tokenizers/punkt')
+    logger.info("NLTK 'punkt' resource found.")
+except LookupError:
+    # If not found, download it
+    logger.warning("NLTK 'punkt' resource not found. Attempting download...")
+    try:
+        nltk.download('punkt', quiet=True)
+        logger.info("NLTK 'punkt' downloaded successfully.")
+        # Verify download (optional but good practice)
+        nltk.data.find('tokenizers/punkt')
+    except Exception as download_error: # Catch potential download errors (network, permissions, etc.)
+        logger.error(f"Failed to download NLTK 'punkt' resource: {download_error}")
+        logger.error("Please try running 'python -m nltk.downloader punkt' manually.")
+        # Depending on your needs, you might want to exit or raise an error here
+        # For now, we'll just log the error and proceed, ROUGE might fail later.
+        # raise RuntimeError("Failed to download NLTK 'punkt', cannot compute ROUGE.") from download_error
+
+# Load the ROUGE metric calculator
+rouge_metric = evaluate.load("rouge")
+
 
 # --- Model Definition ---
 # Modified VisionAugmentedLLM to accept pre-computed embeddings
@@ -369,6 +399,41 @@ class EmbeddingLLMTrainer(Trainer):
 
         return (loss, outputs) if return_outputs else loss
 
+def compute_metrics(eval_preds):
+    """Computes ROUGE scores for evaluation."""
+    preds, labels = eval_preds
+    # preds are logits, labels are token ids
+
+    # Decode predictions
+    # Replace -100 in labels as tokenizer cannot decode them
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    # Get token ids from logits using argmax
+    pred_ids = np.argmax(preds[0] if isinstance(preds, tuple) else preds, axis=-1) # preds might be tuple (logits, ...)
+
+    # Decode tokens to text
+    decoded_preds = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    # ROUGE expects newline after each sentence
+    decoded_preds = ["\n".join(nltk.sent_tokenize(pred.strip())) for pred in decoded_preds]
+    decoded_labels = ["\n".join(nltk.sent_tokenize(label.strip())) for label in decoded_labels]
+
+    # Compute ROUGE scores
+    result = rouge_metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+
+    # Extract specific ROUGE scores
+    result = {key: value * 100 for key, value in result.items()} # Scale to 0-100
+
+    # Add prediction lengths (optional but useful)
+    prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in pred_ids]
+    result["gen_len"] = np.mean(prediction_lens)
+
+    return {k: round(v, 4) for k, v in result.items()} # Round for cleaner logging
+
+
+
+
+
 # --- Main Training Script ---
 if __name__ == "__main__":
     # Load data
@@ -437,13 +502,18 @@ if __name__ == "__main__":
         # gradient_checkpointing_kwargs={'use_reentrant': False}, # Often needed for newer models
         save_total_limit=2,
         load_best_model_at_end=True if val_dataset else False, # Load best only if evaluating
-        metric_for_best_model="loss" if val_dataset else None, # Metric only if evaluating
-        greater_is_better=False if val_dataset else None,
-        report_to="tensorboard",
+        # --- MODIFIED: Use a ROUGE score for best model selection ---
+        metric_for_best_model="rougeL" if val_dataset else None, # e.g., use ROUGE-L
+        greater_is_better=True if val_dataset else None, # ROUGE is better higher
+        # ---        
+        report_to="wandb",
         # Disable safetensors due to shared weight issue with Qwen model + safetensors library
         # Fall back to saving as pytorch_model.bin
         save_safetensors=False,
-        logging_dir=f"{OUTPUT_DIR}/logs", # Separate logs dir
+        # logging_dir=f"{OUTPUT_DIR}/logs", # Separate logs dir
+        # --- ADDED: Tell trainer to compute predictions for metrics ---
+        #predict_with_generate=False, # Set to True if you want metrics based on generated text (slower, more complex setup usually)
+                                     # Set to False (default usually works) for metrics based on teacher-forcing logits (like ROUGE on predicted tokens)
     )
 
     # Ensure gradient_checkpointing_kwargs is set correctly if needed
@@ -459,7 +529,8 @@ if __name__ == "__main__":
         train_dataset=train_dataset,
         eval_dataset=val_dataset, # Pass None if not available
         data_collator=collate_fn,
-        tokenizer=tokenizer # Pass tokenizer for saving purposes
+        tokenizer=tokenizer, # Pass tokenizer for saving purposes
+        compute_metrics=compute_metrics if val_dataset else None
     )
 
     # Train model
