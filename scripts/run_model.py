@@ -32,12 +32,13 @@ IMAGE_SIZE = (224, 224) # Standard size for CLIP vision model
 # This class structure is needed for INFERENCE because it includes
 # the vision model and image processor required to handle a raw image input.
 # The trained weights loaded later will update llm and vision_projection.
-class VisionAugmentedLLM(nn.Module):
-    def __init__(self, llm_model_name, vision_model_name):
+class PatchVisionAugmentedLLM(nn.Module):
+    def __init__(self, llm_model_name, vision_model_name, num_patches=49):
         super().__init__()
-        logger.info(f"Initializing VisionAugmentedLLM for inference:")
+        logger.info(f"Initializing PatchVisionAugmentedLLM for inference:")
         logger.info(f"  LLM: {llm_model_name}")
         logger.info(f"  Vision Encoder: {vision_model_name}")
+        logger.info(f"  Using {num_patches} patch embeddings")
 
         # Load vision encoder components
         self.vision_model = AutoModel.from_pretrained(vision_model_name)
@@ -50,17 +51,17 @@ class VisionAugmentedLLM(nn.Module):
         if self.tokenizer.pad_token is None:
              logger.warning("Tokenizer missing pad token, setting to eos_token.")
              self.tokenizer.pad_token = self.tokenizer.eos_token
-             # Note: Resizing embeddings shouldn't be necessary if loading trained weights
-             # that were trained with this tokenizer state.
-             # self.llm.resize_token_embeddings(len(self.tokenizer))
         logger.info("  LLM and tokenizer loaded.")
 
-        # Vision features projection layer
-        # Dimensions must match the models used
-        vision_dim = self.vision_model.config.projection_dim # e.g., 512 for CLIP base
+        # Patch-based vision features projection layer
+        # For ViT-B/32: patch_dim = 768, projection_dim = 512 (but we want patch features, not global)
+        patch_dim = 768  # ViT-B/32 patch dimension
         llm_dim = self.llm.config.hidden_size # e.g., 896 for Qwen2.5-0.5B
-        self.vision_projection = nn.Linear(vision_dim, llm_dim)
-        logger.info(f"  Created vision projection layer: {vision_dim} -> {llm_dim}")
+        self.num_patches = num_patches
+        
+        self.patch_projection = nn.Linear(patch_dim, llm_dim)
+        self.patch_position_embeddings = nn.Embedding(self.num_patches, llm_dim)
+        logger.info(f"  Created patch projection layer: {patch_dim} -> {llm_dim} for {num_patches} patches")
 
         # No need for config delegation or gradient checkpointing methods in inference
 
@@ -77,8 +78,11 @@ class VisionAugmentedLLM(nn.Module):
     def get_vision_model(self):
         return self.vision_model
 
-    def get_vision_projection(self):
-        return self.vision_projection
+    def get_patch_projection(self):
+        return self.patch_projection
+    
+    def get_patch_position_embeddings(self):
+        return self.patch_position_embeddings
 
     # The forward method here is less relevant for typical HF generation,
     # as we'll use the .generate() method of the underlying LLM.
@@ -87,7 +91,7 @@ class VisionAugmentedLLM(nn.Module):
 # --- Generation function for inference ---
 @torch.no_grad() # Ensure no gradients are computed during inference
 def generate_shader_from_image(
-    model: VisionAugmentedLLM,
+    model: PatchVisionAugmentedLLM,
     image_path: str,
     instruction: str = "Generate an HLSL shader that reproduces this image",
     max_new_tokens: int = 1024,
@@ -95,10 +99,10 @@ def generate_shader_from_image(
     generation_dtype: torch.dtype = torch.float32 # Use float32 for MPS compatibility
 ):
     """
-    Generates shader code from an image using the trained VisionAugmentedLLM.
+    Generates shader code from an image using the trained PatchVisionAugmentedLLM.
 
     Args:
-        model: The loaded VisionAugmentedLLM instance.
+        model: The loaded PatchVisionAugmentedLLM instance.
         image_path: Path to the input image file.
         instruction: The instruction text for the model.
         max_new_tokens: Maximum number of tokens to generate for the shader code.
@@ -116,7 +120,8 @@ def generate_shader_from_image(
     # --- Access model components (now on the correct device/dtype) ---
     image_processor = model.get_image_processor()
     vision_model = model.get_vision_model()
-    vision_projection = model.get_vision_projection()
+    patch_projection = model.get_patch_projection()
+    patch_position_embeddings = model.get_patch_position_embeddings()
     llm = model.get_llm()
     tokenizer = model.get_tokenizer()
 
@@ -137,17 +142,26 @@ def generate_shader_from_image(
     image_inputs = image_processor(images=image, return_tensors="pt")
     pixel_values = image_inputs['pixel_values'].to(device=device, dtype=generation_dtype)
 
-    # Get image features from the vision model
+    # Get patch features from the vision model (not global features)
     # Vision model is already on the correct device/dtype from model.to()
-    image_features = vision_model.get_image_features(pixel_values=pixel_values)
-    # image_features should have shape [batch_size, vision_dim], e.g., [1, 512]
-
-    # Project image features to the LLM's embedding dimension
+    vision_outputs = vision_model.vision_model(pixel_values=pixel_values)
+    
+    # Extract patch embeddings (exclude CLS token)
+    # vision_outputs.last_hidden_state has shape [1, num_patches + 1, hidden_dim]
+    # We exclude the first token (CLS token) to get only patch tokens
+    patch_features = vision_outputs.last_hidden_state[:, 1:, :]  # [1, 49, 768] for ViT-B/32
+    
+    # Project patch features to the LLM's embedding dimension
     # Projection layer is already on the correct device/dtype
-    projected_features = vision_projection(image_features)
-    # Add sequence dimension: [1, 1, llm_dim]
-    projected_features = projected_features.unsqueeze(1)
-    logger.info(f"Image processed and features projected. Shape: {projected_features.shape}")
+    projected_patches = patch_projection(patch_features)  # [1, 49, llm_dim]
+    
+    # Add position embeddings to each patch
+    batch_size = projected_patches.shape[0]
+    position_ids = torch.arange(model.num_patches, device=device).unsqueeze(0).expand(batch_size, -1)
+    position_embeds = patch_position_embeddings(position_ids)
+    projected_features = projected_patches + position_embeds  # [1, 49, llm_dim]
+    
+    logger.info(f"Image processed and patch features projected. Shape: {projected_features.shape}")
     #logger.info(f"Instructions: {instruction}")
     #logger.info(f"{os.path.basename(image_path)}")
 
@@ -158,10 +172,10 @@ def generate_shader_from_image(
 {instruction}
 
 ### Input Reference:
-Image corresponding to embedding for: {os.path.basename(image_path)}
+Image corresponding to patch embeddings for: {os.path.basename(image_path)}
 
 ### Response:
-""" # Note: Changed Input format slightly to match training dataset example
+""" # Updated to match patch embedding training format
     # Tokenize the prompt
     logger.info(f"Instructions: {prompt}")
     prompt_inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=True).to(device)
@@ -177,18 +191,18 @@ Image corresponding to embedding for: {os.path.basename(image_path)}
     prompt_embeds = embed_layer(prompt_input_ids) # Shape: [1, prompt_seq_len, llm_dim]
 
 
-    # --- 4. Combine Visual and Text Embeddings ---
+    # --- 4. Combine Patch and Text Embeddings ---
     # Concatenate along the sequence dimension (dim=1)
-    # Visual token first: [1, 1, dim] + [1, prompt_seq_len, dim] -> [1, 1 + prompt_seq_len, dim]
+    # Patch tokens first: [1, num_patches, dim] + [1, prompt_seq_len, dim] -> [1, num_patches + prompt_seq_len, dim]
     combined_embeds = torch.cat([projected_features, prompt_embeds], dim=1)
     logger.info(f"Combined embedding shape: {combined_embeds.shape}")
 
 
     # --- 5. Create Combined Attention Mask ---
-    # Attention mask for the single visual token (always attend to it)
-    visual_attention = torch.ones(projected_features.shape[:2], dtype=torch.long, device=device) # Shape: [1, 1]
-    # Concatenate attention masks: [1, 1] + [1, prompt_seq_len] -> [1, 1 + prompt_seq_len]
-    combined_attention_mask = torch.cat([visual_attention, prompt_attention_mask], dim=1)
+    # Attention mask for all patch tokens (always attend to them)
+    patch_attention = torch.ones(projected_features.shape[:2], dtype=torch.long, device=device) # Shape: [1, num_patches]
+    # Concatenate attention masks: [1, num_patches] + [1, prompt_seq_len] -> [1, num_patches + prompt_seq_len]
+    combined_attention_mask = torch.cat([patch_attention, prompt_attention_mask], dim=1)
     logger.info(f"Combined attention mask shape: {combined_attention_mask.shape}")
 
 
@@ -215,8 +229,8 @@ Image corresponding to embedding for: {os.path.basename(image_path)}
     # Decode the generated part by slicing off the prompt tokens
     # Note: output_ids shape is [batch_size, total_sequence_length]
     prompt_length = prompt_input_ids.shape[1] # Length of the input prompt tokens
-    # Add 1 for the visual token that was prepended
-    effective_prompt_length = 1 + prompt_length
+    # Add num_patches for the patch tokens that were prepended
+    effective_prompt_length = model.num_patches + prompt_length
     # Slice the output_ids to get only the generated token IDs
     generated_ids = output_ids[0, effective_prompt_length:]
 
@@ -255,8 +269,8 @@ if __name__ == "__main__":
 
     # --- Instantiate the Model Structure ---
     # We instantiate the full structure including vision parts for inference.
-    logger.info(f"Instantiating model structure: VisionAugmentedLLM")
-    model_structure = VisionAugmentedLLM(LLM_MODEL_NAME, VISION_MODEL_NAME)
+    logger.info(f"Instantiating model structure: PatchVisionAugmentedLLM")
+    model_structure = PatchVisionAugmentedLLM(LLM_MODEL_NAME, VISION_MODEL_NAME, num_patches=49)
 
     # --- Load the Trained Weights ---
     # Expecting pytorch_model.bin due to previous saving issues with safetensors
@@ -274,7 +288,7 @@ if __name__ == "__main__":
         state_dict = torch.load(weights_path, map_location="cpu")
 
         # Load the state dict into the model structure
-        # Set strict=False because the state_dict from training (EmbeddingAugmentedLLM)
+        # Set strict=False because the state_dict from training (PatchEmbeddingAugmentedLLM)
         # will NOT contain weights for the vision_model.* parts. This is expected.
         # The vision_model parts will keep their pre-trained weights.
         missing_keys, unexpected_keys = model_structure.load_state_dict(state_dict, strict=False)

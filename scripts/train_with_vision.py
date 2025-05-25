@@ -62,30 +62,33 @@ rouge_metric = evaluate.load("rouge")
 
 
 # --- Model Definition ---
-# Modified VisionAugmentedLLM to accept pre-computed embeddings
-class EmbeddingAugmentedLLM(nn.Module):
-    # Removed vision_model_name argument
-    def __init__(self, llm_model_name, clip_embedding_dim, num_visual_tokens=1): # num_visual_tokens often 1 for this approach
+# Enhanced PatchVisionAugmentedLLM with patch-based features
+class PatchEmbeddingAugmentedLLM(nn.Module):
+    def __init__(self, llm_model_name, clip_patch_dim=768, num_patches=49): # ViT-B/32 has 49 patches (7x7)
         super().__init__()
-        logger.info(f"Initializing EmbeddingAugmentedLLM with LLM: {llm_model_name}")
+        logger.info(f"Initializing PatchEmbeddingAugmentedLLM with LLM: {llm_model_name}")
+        logger.info(f"Using patch-based vision with {num_patches} patches of dimension {clip_patch_dim}")
+        
         # Load LLM
         self.llm = AutoModelForCausalLM.from_pretrained(llm_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
         if self.tokenizer.pad_token is None:
              logger.warning("Tokenizer missing pad token, setting to eos_token.")
              self.tokenizer.pad_token = self.tokenizer.eos_token
-             # Optional: Resize embeddings if you are *sure* the token didn't exist before
-             # self.llm.resize_token_embeddings(len(self.tokenizer))
-             # logger.info(f"Resized LLM token embeddings to: {len(self.tokenizer)}")
 
-        # Vision features projection (using the known CLIP dimension)
+        # Vision features projection for patch-based features
         llm_dim = self.llm.config.hidden_size
-        self.clip_embedding_dim = clip_embedding_dim # Store dimension
+        self.clip_patch_dim = clip_patch_dim
+        self.num_patches = num_patches
 
-        # Project CLIP embedding features (e.g., 512) to LLM dim
-        # This layer *will* be trained
-        self.vision_projection = nn.Linear(self.clip_embedding_dim, llm_dim)
-        logger.info(f"Created projection layer: {self.clip_embedding_dim} -> {llm_dim}")
+        # Project CLIP patch features (768 for ViT-B/32 patches) to LLM dim
+        # This handles a sequence of patch embeddings
+        self.patch_projection = nn.Linear(self.clip_patch_dim, llm_dim)
+        logger.info(f"Created patch projection layer: {self.clip_patch_dim} -> {llm_dim}")
+        
+        # Optional: Learnable patch position embeddings
+        self.patch_position_embeddings = nn.Embedding(self.num_patches, llm_dim)
+        logger.info(f"Created position embeddings for {self.num_patches} patches")
 
         # --- Delegate config for Trainer compatibility ---
         self.config = self.llm.config
@@ -105,53 +108,59 @@ class EmbeddingAugmentedLLM(nn.Module):
         else:
             logger.warning("Underlying LLM does not support gradient_checkpointing_disable.")
 
-    # Modified forward to accept 'clip_embeddings' instead of 'images'
-    def forward(self, input_ids, attention_mask, clip_embeddings=None, labels=None):
+    # Modified forward to accept 'clip_patch_embeddings' for patch-based features
+    def forward(self, input_ids, attention_mask, clip_patch_embeddings=None, labels=None):
         batch_size = input_ids.shape[0]
         embed_layer = self.llm.get_input_embeddings()
         llm_device = embed_layer.weight.device # Get device from LLM embedding layer
 
-        if clip_embeddings is not None:
+        if clip_patch_embeddings is not None:
             # Ensure embeddings are float and on the correct device
-            # Expected shape: [batch_size, clip_embedding_dim]
-            if clip_embeddings.shape[-1] != self.clip_embedding_dim:
-                 raise ValueError(f"Input clip_embeddings dim ({clip_embeddings.shape[-1]}) does not match expected dim ({self.clip_embedding_dim})")
+            # Expected shape: [batch_size, num_patches, clip_patch_dim]
+            if len(clip_patch_embeddings.shape) != 3:
+                raise ValueError(f"Input clip_patch_embeddings must be 3D [batch, patches, dim], got shape {clip_patch_embeddings.shape}")
+            if clip_patch_embeddings.shape[1] != self.num_patches:
+                raise ValueError(f"Input patch count ({clip_patch_embeddings.shape[1]}) does not match expected ({self.num_patches})")
+            if clip_patch_embeddings.shape[2] != self.clip_patch_dim:
+                raise ValueError(f"Input patch dim ({clip_patch_embeddings.shape[2]}) does not match expected dim ({self.clip_patch_dim})")
 
-            clip_embeddings = clip_embeddings.to(dtype=self.vision_projection.weight.dtype, device=llm_device) # Match projection layer type
+            clip_patch_embeddings = clip_patch_embeddings.to(dtype=self.patch_projection.weight.dtype, device=llm_device)
 
-            # Project vision features to LLM embedding dimension
-            # Shape: [batch_size, llm_dim]
-            projected_features = self.vision_projection(clip_embeddings)
-
-            # Unsqueeze to add sequence dimension: [batch_size, 1, llm_dim] (Prepending ONE token)
-            projected_features = projected_features.unsqueeze(1)
+            # Project patch features to LLM embedding dimension
+            # Shape: [batch_size, num_patches, llm_dim]
+            projected_patches = self.patch_projection(clip_patch_embeddings)
+            
+            # Add position embeddings to each patch
+            position_ids = torch.arange(self.num_patches, device=llm_device).unsqueeze(0).expand(batch_size, -1)
+            position_embeds = self.patch_position_embeddings(position_ids)
+            projected_features = projected_patches + position_embeds
 
             # Get text embeddings
             input_ids = input_ids.to(llm_device)
             inputs_embeds = embed_layer(input_ids) # Shape: [batch_size, seq_len, llm_dim]
 
-            # Combine visual feature and text embeddings
-            # Shape: [batch_size, 1 + seq_len, llm_dim]
+            # Combine patch features and text embeddings
+            # Shape: [batch_size, num_patches + seq_len, llm_dim]
             combined_embeds = torch.cat([projected_features, inputs_embeds], dim=1)
 
-            # Extend attention mask
+            # Extend attention mask for all patches
             attention_mask = attention_mask.to(llm_device)
-            visual_attention = torch.ones(batch_size, 1, dtype=attention_mask.dtype, device=llm_device) # Match dtype
-            # Shape: [batch_size, 1 + seq_len]
-            new_attention_mask = torch.cat([visual_attention, attention_mask], dim=1)
+            patch_attention = torch.ones(batch_size, self.num_patches, dtype=attention_mask.dtype, device=llm_device)
+            # Shape: [batch_size, num_patches + seq_len]
+            new_attention_mask = torch.cat([patch_attention, attention_mask], dim=1)
 
-            # Adjust labels if provided (ignore visual token in loss)
+            # Adjust labels if provided (ignore all patch tokens in loss)
             if labels is not None:
                 labels = labels.to(llm_device)
-                # Shape: [batch_size, 1] filled with -100
-                visual_labels = torch.full((batch_size, 1), -100, dtype=torch.long, device=llm_device)
-                # Shape: [batch_size, 1 + seq_len]
-                new_labels = torch.cat([visual_labels, labels], dim=1)
+                # Shape: [batch_size, num_patches] filled with -100
+                patch_labels = torch.full((batch_size, self.num_patches), -100, dtype=torch.long, device=llm_device)
+                # Shape: [batch_size, num_patches + seq_len]
+                new_labels = torch.cat([patch_labels, labels], dim=1)
             else:
                 new_labels = None
 
             # --- Label Padding/Truncation (Important!) ---
-            # Ensure labels match the final sequence length after prepending visual token
+            # Ensure labels match the final sequence length after prepending patch tokens
             expected_seq_len = combined_embeds.shape[1]
             if new_labels is not None and new_labels.shape[1] != expected_seq_len:
                  current_len = new_labels.shape[1]
@@ -160,7 +169,7 @@ class EmbeddingAugmentedLLM(nn.Module):
                      pad_len = expected_seq_len - current_len
                      padding = torch.full((batch_size, pad_len), -100, dtype=torch.long, device=llm_device)
                      new_labels = torch.cat([new_labels, padding], dim=1)
-                 # Truncate if new_labels is longer (shouldn't typically happen if input_ids were padded correctly)
+                 # Truncate if new_labels is longer
                  elif current_len > expected_seq_len:
                      new_labels = new_labels[:, :expected_seq_len]
 
@@ -179,7 +188,7 @@ class EmbeddingAugmentedLLM(nn.Module):
             return outputs
         else:
             # Text-only forward pass (ensure gradient checkpointing status is respected)
-             logger.warning("Performing text-only forward pass (no clip_embeddings provided).")
+             logger.warning("Performing text-only forward pass (no clip_patch_embeddings provided).")
              input_ids = input_ids.to(llm_device)
              attention_mask = attention_mask.to(llm_device)
              labels = labels.to(llm_device) if labels is not None else None
@@ -192,41 +201,92 @@ class EmbeddingAugmentedLLM(nn.Module):
 
 
 # --- Data Preparation ---
-# Modified data loading function
-def load_examples_with_embeddings(data_dir):
+# Modified data loading function for patch embeddings
+def load_examples_with_patch_embeddings(data_dir):
     examples = []
-    required_keys = ["instruction", "input", "output", "clip_embeddings"]
-    json_files = glob(f"{data_dir}/example_*.json")
+    required_keys = ["instruction", "input", "output", "clip_patch_embeddings"]
+    # Look for patch embedding files first, fall back to regular embeddings
+    json_files = glob(f"{data_dir}/example_patch_*.json")
+    if not json_files:
+        logger.warning(f"No patch embedding files found, falling back to regular embeddings")
+        json_files = glob(f"{data_dir}/example_*.json")
+    
     logger.info(f"Found {len(json_files)} JSON files in {data_dir}")
 
     skipped_count = 0
     loaded_count = 0
+    
     for json_path in json_files:
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 example = json.load(f)
 
-            # Validate required keys and embedding format
-            if not all(key in example for key in required_keys):
-                logger.warning(f"Skipping {json_path}: Missing one or more required keys ({required_keys}).")
+            # Check if this is a patch embedding file or regular embedding file
+            is_patch_file = "clip_patch_embeddings" in example
+            is_regular_file = "clip_embeddings" in example
+            
+            if is_patch_file:
+                # Validate patch embedding format
+                if not all(key in example for key in required_keys):
+                    logger.warning(f"Skipping {json_path}: Missing required keys for patch embeddings.")
+                    skipped_count += 1
+                    continue
+
+                patch_embeddings = example["clip_patch_embeddings"]
+                if not isinstance(patch_embeddings, list) or not patch_embeddings:
+                    logger.warning(f"Skipping {json_path}: 'clip_patch_embeddings' is not a non-empty list.")
+                    skipped_count += 1
+                    continue
+
+                # Validate patch structure
+                if not all(isinstance(patch, list) for patch in patch_embeddings):
+                    logger.warning(f"Skipping {json_path}: Invalid patch embedding structure.")
+                    skipped_count += 1
+                    continue
+
+                # Check dimensions
+                expected_patches = 49  # For ViT-B/32
+                expected_dim = 768
+                
+                if len(patch_embeddings) != expected_patches:
+                    logger.warning(f"Skipping {json_path}: Expected {expected_patches} patches, got {len(patch_embeddings)}")
+                    skipped_count += 1
+                    continue
+                    
+                if patch_embeddings and len(patch_embeddings[0]) != expected_dim:
+                    logger.warning(f"Skipping {json_path}: Expected patch dim {expected_dim}, got {len(patch_embeddings[0])}")
+                    skipped_count += 1
+                    continue
+
+                examples.append(example)
+                loaded_count += 1
+                
+            elif is_regular_file:
+                # Convert regular embeddings to patch format (duplicate single embedding)
+                logger.info(f"Converting regular embedding to patch format for {json_path}")
+                
+                regular_embedding = example["clip_embeddings"]
+                if len(regular_embedding) != CLIP_EMBEDDING_DIM:
+                    logger.warning(f"Skipping {json_path}: Wrong embedding dimension")
+                    skipped_count += 1
+                    continue
+                
+                # Create fake patch embeddings by duplicating the global embedding
+                # This is not ideal but allows backward compatibility
+                fake_patch_embeddings = [regular_embedding] * 49  # Duplicate for 49 patches
+                
+                # Create new example with patch format
+                patch_example = example.copy()
+                patch_example["clip_patch_embeddings"] = fake_patch_embeddings
+                patch_example["num_patches"] = 49
+                patch_example["patch_dim"] = CLIP_EMBEDDING_DIM
+                
+                examples.append(patch_example)
+                loaded_count += 1
+                
+            else:
+                logger.warning(f"Skipping {json_path}: No valid embedding format found")
                 skipped_count += 1
-                continue
-
-            if not isinstance(example["clip_embeddings"], list) or not example["clip_embeddings"]:
-                 logger.warning(f"Skipping {json_path}: 'clip_embeddings' is not a non-empty list.")
-                 skipped_count += 1
-                 continue
-
-            # Optionally check embedding dimension here if known
-            if len(example["clip_embeddings"]) != CLIP_EMBEDDING_DIM:
-                 logger.warning(f"Skipping {json_path}: Embedding dimension is {len(example['clip_embeddings'])}, expected {CLIP_EMBEDDING_DIM}.")
-                 skipped_count += 1
-                 continue
-
-            # We don't need the image path anymore for training
-            # but keep the original 'input' field as it might be used in the prompt
-            examples.append(example)
-            loaded_count += 1
 
         except json.JSONDecodeError:
             logger.error(f"Skipping {json_path}: Invalid JSON.")
@@ -235,12 +295,11 @@ def load_examples_with_embeddings(data_dir):
             logger.error(f"Error loading example from {json_path}: {e}")
             skipped_count += 1
 
-    logger.info(f"Loaded {loaded_count} valid examples with embeddings from {data_dir}. Skipped {skipped_count}.")
+    logger.info(f"Loaded {loaded_count} valid examples with patch embeddings from {data_dir}. Skipped {skipped_count}.")
     return examples
 
-# Modified Dataset to use embeddings
-class ShaderEmbeddingDataset(torch.utils.data.Dataset):
-    # Removed image_processor
+# Modified Dataset to use patch embeddings
+class ShaderPatchEmbeddingDataset(torch.utils.data.Dataset):
     def __init__(self, examples, tokenizer, max_length=2048):
         self.examples = examples
         self.tokenizer = tokenizer
@@ -253,134 +312,100 @@ class ShaderEmbeddingDataset(torch.utils.data.Dataset):
         example = self.examples[idx]
 
         # Format prompt (using the 'input' field which contains the image filename)
-        # Ensure the 'input' field is just the filename as intended by generate_example_json.py
         image_ref = example['input'] # Should be like "002.png"
         prompt = f"""### Instruction:
 {example['instruction']}
 
 ### Input Reference:
-Image corresponding to embedding for: {image_ref}
+Image corresponding to patch embeddings for: {image_ref}
 
 ### Response:
 """
         response = example['output']
 
         # Tokenize text (prompt + response)
-        # Important: Account for the visual token potentially pushing text out
-        # Leave some buffer, maybe max_length - num_visual_tokens (here, max_length - 1)
-        # However, HF Trainer usually handles padding/truncation well based on `max_length`
+        # Account for patch tokens taking up sequence space
         tokenized_input = self.tokenizer(
-            prompt + response + self.tokenizer.eos_token, # Add EOS token explicitly
+            prompt + response + self.tokenizer.eos_token,
             truncation=True,
-            max_length=self.max_length, # Max length for text part
-            padding="max_length", # Pad text part to max_length
+            max_length=self.max_length,
+            padding="max_length",
             return_tensors="pt"
         )
 
         # Create labels: -100 for prompt tokens to ignore them in loss
-        labels = tokenized_input["input_ids"].clone().squeeze() # Squeeze to 1D
+        labels = tokenized_input["input_ids"].clone().squeeze()
 
-        # Tokenize prompt *separately* to find length accurately
-        prompt_tokens = self.tokenizer(
+        # Tokenize prompt separately to find length accurately
+        tokenized_prompt_only = self.tokenizer(
             prompt,
-            add_special_tokens=False # Don't add BOS/EOS here if they are part of the main tokenization
+            add_special_tokens=True  # Match the full tokenization
         )["input_ids"]
-        prompt_len = len(prompt_tokens)
-
-        # Use prompt_len, but be careful with special tokens (like BOS) added by default
-        # A safer way might be tokenizing prompt+response and prompt, then finding the difference
-        # Or, simpler: find the start of the response after tokenization
-        full_text = prompt + response + self.tokenizer.eos_token
-        tokenized_full = self.tokenizer(full_text, truncation=True, max_length=self.max_length)["input_ids"]
-        tokenized_prompt_only = self.tokenizer(prompt, truncation=True, max_length=self.max_length)["input_ids"]
-
-        # Assuming prompt doesn't contain EOS/PAD tokens internally that match the actual ones
-        # This calculation needs care depending on tokenizer specifics (BOS tokens etc.)
-        # Let's stick to the simpler method for now, assuming it's roughly correct
-        # Adjust index carefully if BOS token is added automatically
         prompt_token_length = len(tokenized_prompt_only)
-        if self.tokenizer.bos_token_id is not None and tokenized_full[0] == self.tokenizer.bos_token_id:
-            # If tokenizer adds BOS, the prompt length might seem off by 1 relative to combined sequence
-             pass # Adjust logic if needed based on specific tokenizer behavior
 
         # Mask prompt tokens
         labels[:prompt_token_length] = -100
 
-        # Handle potential truncation where response gets cut off
-        # Ensure label isn't -100 for the very last *actual* token if it wasn't padding
+        # Handle padding
         input_ids_squeezed = tokenized_input["input_ids"].squeeze()
-        # Find the index of the first padding token (if any)
         pad_token_indices = (input_ids_squeezed == self.tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
         first_pad_index = pad_token_indices[0].item() if len(pad_token_indices) > 0 else len(labels)
-        # Make sure labels beyond the first pad token are also -100
         if first_pad_index < len(labels):
              labels[first_pad_index:] = -100
 
-        # Ensure EOS token has a valid label if it wasn't masked or padded out
-        eos_token_indices = (input_ids_squeezed == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
-        if len(eos_token_indices) > 0:
-            last_eos_index = eos_token_indices[-1].item()
-            if last_eos_index < first_pad_index and last_eos_index >= prompt_token_length:
-                 # If the last EOS is part of the response and not masked/padded, keep its label
-                 pass # Label should already be the EOS token ID
-            # If EOS was part of prompt or padding, it should remain -100
-
-
-        # Load pre-computed embedding and convert to tensor
-        clip_embedding_list = example["clip_embeddings"]
-        clip_embedding_tensor = torch.tensor(clip_embedding_list, dtype=torch.float)
+        # Load pre-computed patch embeddings and convert to tensor
+        clip_patch_embeddings = example["clip_patch_embeddings"]
+        # Convert list of lists to tensor: [num_patches, patch_dim]
+        clip_patch_tensor = torch.tensor(clip_patch_embeddings, dtype=torch.float)
 
         return {
             "input_ids": input_ids_squeezed,
-            "attention_mask": tokenized_input["attention_mask"].squeeze(), # Squeeze to 1D
+            "attention_mask": tokenized_input["attention_mask"].squeeze(),
             "labels": labels,
-            "clip_embeddings": clip_embedding_tensor # Return the embedding tensor
+            "clip_patch_embeddings": clip_patch_tensor  # [49, 768] for ViT-B/32
         }
 
-# Modified data collator
-def collate_fn(batch):
+# Modified data collator for patch embeddings
+def patch_collate_fn(batch):
     input_ids = torch.stack([item["input_ids"] for item in batch])
     attention_mask = torch.stack([item["attention_mask"] for item in batch])
     labels = torch.stack([item["labels"] for item in batch])
-    # Stack clip embeddings instead of images
-    clip_embeddings = torch.stack([item["clip_embeddings"] for item in batch])
+    # Stack patch embeddings: [batch_size, num_patches, patch_dim]
+    clip_patch_embeddings = torch.stack([item["clip_patch_embeddings"] for item in batch])
 
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
-        "clip_embeddings": clip_embeddings # Pass embeddings in the batch
+        "clip_patch_embeddings": clip_patch_embeddings  # Pass patch embeddings in the batch
     }
 
-# Modified Trainer
-class EmbeddingLLMTrainer(Trainer):
+# Modified Trainer for patch embeddings
+class PatchEmbeddingLLMTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # Extract clip_embeddings instead of images
-        clip_embeddings = inputs.pop("clip_embeddings", None)
+        # Extract clip_patch_embeddings instead of clip_embeddings
+        clip_patch_embeddings = inputs.pop("clip_patch_embeddings", None)
         labels = inputs.get("labels") # Keep labels in inputs for the model
 
-        if clip_embeddings is not None:
-            # Ensure embeddings are on the correct device (matching the model)
-            # Check if model has parameters before accessing device
+        if clip_patch_embeddings is not None:
+            # Ensure patch embeddings are on the correct device (matching the model)
             if list(model.parameters()):
                 model_device = next(model.parameters()).device
-                clip_embeddings = clip_embeddings.to(model_device)
+                clip_patch_embeddings = clip_patch_embeddings.to(model_device)
             else:
-                # Handle case where model might have no parameters (unlikely but safe)
-                logger.warning("Model has no parameters, cannot determine device for embeddings.")
-                # You might default to CPU or raise an error depending on your setup
-                clip_embeddings = clip_embeddings.to('cpu')
+                logger.warning("Model has no parameters, cannot determine device for patch embeddings.")
+                clip_patch_embeddings = clip_patch_embeddings.to('cpu')
 
-            # Forward pass with embeddings
+            # Forward pass with patch embeddings
             outputs = model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 labels=labels,
-                clip_embeddings=clip_embeddings # Pass embeddings to the model
+                clip_patch_embeddings=clip_patch_embeddings  # Pass patch embeddings to the model
             )
         else:
             # Text-only forward pass (should ideally not happen if data is prepared correctly)
-            logger.warning("Trainer compute_loss: clip_embeddings not found in inputs. Performing text-only forward pass.")
+            logger.warning("Trainer compute_loss: clip_patch_embeddings not found in inputs. Performing text-only forward pass.")
             outputs = model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
@@ -390,17 +415,12 @@ class EmbeddingLLMTrainer(Trainer):
         loss = outputs.loss if hasattr(outputs, "loss") else None
         if loss is None:
              logger.error("Model output did not contain 'loss'.")
-             # Handle this case, maybe return a dummy loss or raise error
-             # For now, returning None which might break training loop.
-             # Check model's return structure if this happens.
-             # return (torch.tensor(0.0, device=model_device, requires_grad=True), outputs) if return_outputs else torch.tensor(0.0, device=model_device, requires_grad=True)
              raise ValueError("Model output missing 'loss' attribute.")
-
 
         return (loss, outputs) if return_outputs else loss
 
 def compute_metrics(eval_preds):
-    """Computes ROUGE scores for evaluation."""
+    """Computes ROUGE scores and shader-specific metrics for evaluation."""
     preds, labels = eval_preds
     # preds are logits, labels are token ids
 
@@ -415,11 +435,11 @@ def compute_metrics(eval_preds):
     decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
     # ROUGE expects newline after each sentence
-    decoded_preds = ["\n".join(nltk.sent_tokenize(pred.strip())) for pred in decoded_preds]
-    decoded_labels = ["\n".join(nltk.sent_tokenize(label.strip())) for label in decoded_labels]
+    decoded_preds_rouge = ["\n".join(nltk.sent_tokenize(pred.strip())) for pred in decoded_preds]
+    decoded_labels_rouge = ["\n".join(nltk.sent_tokenize(label.strip())) for label in decoded_labels]
 
     # Compute ROUGE scores
-    result = rouge_metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+    result = rouge_metric.compute(predictions=decoded_preds_rouge, references=decoded_labels_rouge, use_stemmer=True)
 
     # Extract specific ROUGE scores
     result = {key: value * 100 for key, value in result.items()} # Scale to 0-100
@@ -427,6 +447,29 @@ def compute_metrics(eval_preds):
     # Add prediction lengths (optional but useful)
     prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in pred_ids]
     result["gen_len"] = np.mean(prediction_lens)
+
+    # Add shader-specific metrics
+    try:
+        from evaluation_utils import validate_shader_compilation
+        
+        # Compute compilation rate
+        compilation_successes = 0
+        total_predictions = len(decoded_preds)
+        
+        for pred in decoded_preds:
+            if pred.strip():  # Only evaluate non-empty predictions
+                validation_result = validate_shader_compilation(pred)
+                if validation_result["valid"]:
+                    compilation_successes += 1
+        
+        result["compilation_rate"] = (compilation_successes / total_predictions * 100) if total_predictions > 0 else 0.0
+        
+    except ImportError:
+        logger.warning("evaluation_utils not available, skipping shader compilation metrics")
+        result["compilation_rate"] = 0.0
+    except Exception as e:
+        logger.warning(f"Error computing compilation metrics: {e}")
+        result["compilation_rate"] = 0.0
 
     return {k: round(v, 4) for k, v in result.items()} # Round for cleaner logging
 
@@ -436,33 +479,31 @@ def compute_metrics(eval_preds):
 
 # --- Main Training Script ---
 if __name__ == "__main__":
-    # Load data
+    # Load data with patch embeddings
     logger.info("Loading training data...")
-    train_examples = load_examples_with_embeddings(TRAIN_DATA_DIR)
+    train_examples = load_examples_with_patch_embeddings(TRAIN_DATA_DIR)
     logger.info("Loading validation data...")
-    val_examples = load_examples_with_embeddings(VAL_DATA_DIR)
+    val_examples = load_examples_with_patch_embeddings(VAL_DATA_DIR)
 
     if not train_examples:
-        raise ValueError(f"No valid training examples found in {TRAIN_DATA_DIR}. Check JSON files and embedding generation.")
+        raise ValueError(f"No valid training examples found in {TRAIN_DATA_DIR}. Check JSON files and patch embedding generation.")
     if not val_examples:
-        # Optional: Allow training without validation data, but issue a warning
         logger.warning(f"No valid validation examples found in {VAL_DATA_DIR}. Proceeding without validation.")
-        # raise ValueError(f"No valid validation examples found in {VAL_DATA_DIR}. Check JSON files.")
 
-    # Initialize model - Pass embedding dim, remove vision model name
-    logger.info("Initializing model...")
-    # Note: No AutoModel or AutoImageProcessor needed here anymore for the *training* script's model definition
-    model = EmbeddingAugmentedLLM(
+    # Initialize patch-based model
+    logger.info("Initializing patch-based model...")
+    model = PatchEmbeddingAugmentedLLM(
         llm_model_name=LLM_MODEL_NAME,
-        clip_embedding_dim=CLIP_EMBEDDING_DIM
-        )
+        clip_patch_dim=768,  # ViT-B/32 patch dimension
+        num_patches=49       # ViT-B/32 number of patches (7x7)
+    )
 
     # Ensure model's tokenizer is accessible for dataset creation
     tokenizer = model.tokenizer
 
-    # Create datasets - Remove image_processor
-    logger.info("Creating datasets...")
-    train_dataset = ShaderEmbeddingDataset(
+    # Create datasets with patch embeddings
+    logger.info("Creating patch embedding datasets...")
+    train_dataset = ShaderPatchEmbeddingDataset(
         train_examples,
         tokenizer,
         max_length=MAX_LENGTH
@@ -470,7 +511,7 @@ if __name__ == "__main__":
 
     val_dataset = None
     if val_examples:
-         val_dataset = ShaderEmbeddingDataset(
+         val_dataset = ShaderPatchEmbeddingDataset(
              val_examples,
              tokenizer,
              max_length=MAX_LENGTH
@@ -479,41 +520,37 @@ if __name__ == "__main__":
          logger.warning("Validation dataset is empty, evaluation will be skipped.")
 
 
-    # Training arguments
+    # Enhanced training arguments
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=3,
-        per_device_train_batch_size=2, # Can potentially increase slightly now
-        gradient_accumulation_steps=4, # Effective batch size = 2 * 4 = 8
+        num_train_epochs=10,  # Increased for better training
+        per_device_train_batch_size=2,  # Keep small for memory efficiency on macOS
+        gradient_accumulation_steps=8,  # Increased effective batch size = 2 * 8 = 16
         per_device_eval_batch_size=2,
-        eval_strategy="steps" if val_dataset else "no", # Evaluate only if val_dataset exists
-        eval_steps=100 if val_dataset else 0, # Evaluate only if val_dataset exists
+        eval_strategy="steps" if val_dataset else "no",
+        eval_steps=50 if val_dataset else 0,  # More frequent evaluation
         save_steps=100,
-        warmup_steps=50, # Adjust warmup steps based on total steps
+        warmup_ratio=0.1,  # Use ratio instead of fixed steps
         logging_steps=10,
-        learning_rate=2e-5,
-        #bf16=torch.cuda.is_bf16_supported(), # Use BF16 if available
-        #fp16=not torch.cuda.is_bf16_supported(), # Otherwise use FP16 if available
-        # --- MODIFIED for MPS compatibility ---
-    # Disable mixed precision as fp16/bf16 support on MPS via accelerate can be problematic
+        learning_rate=1e-5,  # Lower learning rate for stability with patch features
+        # --- Keep disabled for macOS compatibility ---
         bf16=False,
         fp16=False,
         gradient_checkpointing=True,
-        # gradient_checkpointing_kwargs={'use_reentrant': False}, # Often needed for newer models
-        save_total_limit=2,
-        load_best_model_at_end=True if val_dataset else False, # Load best only if evaluating
-        # --- MODIFIED: Use a ROUGE score for best model selection ---
-        metric_for_best_model="rougeL" if val_dataset else None, # e.g., use ROUGE-L
-        greater_is_better=True if val_dataset else None, # ROUGE is better higher
+        save_total_limit=3,  # Keep more checkpoints
+        load_best_model_at_end=True if val_dataset else False,
+        # --- Use compilation rate as primary metric ---
+        metric_for_best_model="compilation_rate" if val_dataset else None,
+        greater_is_better=True if val_dataset else None,
         # ---        
         report_to="wandb",
-        # Disable safetensors due to shared weight issue with Qwen model + safetensors library
-        # Fall back to saving as pytorch_model.bin
         save_safetensors=False,
-        # logging_dir=f"{OUTPUT_DIR}/logs", # Separate logs dir
-        # --- ADDED: Tell trainer to compute predictions for metrics ---
-        #predict_with_generate=False, # Set to True if you want metrics based on generated text (slower, more complex setup usually)
-                                     # Set to False (default usually works) for metrics based on teacher-forcing logits (like ROUGE on predicted tokens)
+        # --- Enhanced logging ---
+        logging_dir=f"{OUTPUT_DIR}/logs",
+        run_name="patch_vision_shader_model",
+        # --- Data efficiency ---
+        dataloader_num_workers=0,  # Disable multiprocessing for macOS stability
+        remove_unused_columns=False,  # Keep patch embeddings
     )
 
     # Ensure gradient_checkpointing_kwargs is set correctly if needed
@@ -521,14 +558,14 @@ if __name__ == "__main__":
          training_args.gradient_checkpointing_kwargs={'use_reentrant': False}
 
 
-    # Initialize trainer - Use the modified trainer class
-    logger.info("Initializing trainer...")
-    trainer = EmbeddingLLMTrainer(
+    # Initialize trainer - Use the patch embedding trainer class
+    logger.info("Initializing patch embedding trainer...")
+    trainer = PatchEmbeddingLLMTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset, # Pass None if not available
-        data_collator=collate_fn,
+        data_collator=patch_collate_fn,  # Use patch collator
         tokenizer=tokenizer, # Pass tokenizer for saving purposes
         compute_metrics=compute_metrics if val_dataset else None
     )
